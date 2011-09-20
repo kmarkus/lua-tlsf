@@ -17,24 +17,133 @@
 #include "lauxlib.h"
 #include "lualib.h"
 
+#include "tlsf.h"
+#define TLSF_POOL_MIN_SIZE    8*1024*1024
+#define TLSF_POOL_DEF_SIZE    TLSF_POOL_MIN_SIZE
 
+
+#define	TLSF_DEBUG		1
+#define DEBUG_TLSF_ALLOC	(1<<0)
+#define DEBUG_TLSF_FREE		(1<<1)
+#define DEBUG_TLSF_TRACE	(1<<20)
+
+#ifdef TLSF_DEBUG
+static unsigned int tlsf_mask = 0;
+# define _DBG(x, fmt, args...) do{ if (tlsf_mask & x) printf("%s: " fmt "\n", __FUNCTION__, ##args); } while(0);
+#else
+# define _DBG(x, fmt, args...) do { } while(0);
+#endif
 
 static lua_State *globalL = NULL;
 
 static const char *progname = LUA_PROGNAME;
 
+/* tlsf stuff */
+static char *pool;
+static unsigned int pool_size;
 
+#ifdef TLSF_DEBUG
+static void tlsf_trace_hook(lua_State *L, lua_Debug *ar)
+{
+	lua_sethook(globalL, tlsf_trace_hook, 0, 0);
+	luaL_error(L, "memory allocation in tlsf trace mode");
+}
 
-static void lstop (lua_State *L, lua_Debug *ar) {
-  (void)ar;  /* unused arg. */
-  lua_sethook(L, NULL, 0, 0);
-  luaL_error(L, "interrupted!");
+static int tlsf_trace(lua_State *L)
+{
+	int argc, enable, ret;
+	ret = 0;
+	argc = lua_gettop(L);
+
+	if(argc == 0) {
+		lua_pushboolean(L, tlsf_mask & DEBUG_TLSF_TRACE);
+		ret = 1;
+		goto out;
+	}
+
+	enable = lua_toboolean(L, 1);
+
+	if(enable) {
+		tlsf_mask |= DEBUG_TLSF_TRACE;
+	} else {
+		lua_sethook(globalL, tlsf_trace_hook, 0, 1);
+		tlsf_mask &= ~DEBUG_TLSF_TRACE;
+	}
+
+out:
+	return ret;
+}
+
+static int tlsf_warn(lua_State *L)
+{
+	int argc, enable, ret;
+
+	ret = 0;
+	argc = lua_gettop(L);
+
+	if( argc == 0) {
+		lua_pushboolean(L, tlsf_mask & (DEBUG_TLSF_ALLOC | DEBUG_TLSF_FREE));
+		ret = 1;
+		goto out;
+	}
+
+	enable = lua_toboolean(L, 1);
+
+	if(enable)
+		tlsf_mask |= DEBUG_TLSF_ALLOC | DEBUG_TLSF_FREE;
+	else
+		tlsf_mask &= ~(DEBUG_TLSF_ALLOC | DEBUG_TLSF_FREE);
+out:
+	return ret;
+}
+
+static int tlsf_stats(lua_State *L)
+{
+	lua_pushinteger(L, get_used_size(pool));
+	lua_pushinteger(L, get_max_size(pool));
+	lua_pushinteger(L, pool_size);
+	return 3;
 }
 
 
+static const struct luaL_Reg tlsf_f [] = {
+	{"stats", tlsf_stats },
+	{"warn", tlsf_warn },
+	{"trace", tlsf_trace },
+	{NULL, NULL}
+};
+#endif /* DEBUG */
+
+static void *tlsf_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
+	(void)ud;
+	(void)osize;
+	if (nsize == 0) {
+		_DBG(DEBUG_TLSF_FREE, "freeing 0x%lx, osize=%lu, nsize=%lu", (unsigned long) ptr, osize, nsize);
+		tlsf_free(ptr);
+		return NULL;
+	}
+	else {
+#ifdef TLSF_DEBUG
+		if(DEBUG_TLSF_TRACE & tlsf_mask) {
+			lua_sethook(globalL, tlsf_trace_hook, LUA_MASKCALL | LUA_MASKRET | LUA_MASKLINE | LUA_MASKCOUNT, 1);
+		}
+#endif /* TLSF_DEBUG */
+
+		_DBG(DEBUG_TLSF_ALLOC, "allocating 0x%lx, osize=%lu, nsize=%lu", (unsigned long) ptr, osize, nsize);
+		return tlsf_realloc(ptr, nsize);
+	}
+}
+
+
+static void lstop (lua_State *L, lua_Debug *ar) {
+	(void)ar;  /* unused arg. */
+	lua_sethook(L, NULL, 0, 0);
+	luaL_error(L, "interrupted!");
+}
+
 static void laction (int i) {
   signal(i, SIG_DFL); /* if another SIGINT happens before lstop,
-                              terminate process (default action) */
+			      terminate process (default action) */
   lua_sethook(globalL, lstop, LUA_MASKCALL | LUA_MASKRET | LUA_MASKCOUNT, 1);
 }
 
@@ -45,6 +154,7 @@ static void print_usage (void) {
   "Available options are:\n"
   "  -e stat  execute string " LUA_QL("stat") "\n"
   "  -l name  require library " LUA_QL("name") "\n"
+  "  -m mem   pre-allocate " LUA_QL("mem") " bytes for real-time memory pool\n"
   "  -i       enter interactive mode after executing " LUA_QL("script") "\n"
   "  -v       show version information\n"
   "  --       stop handling options\n"
@@ -224,9 +334,9 @@ static void dotty (lua_State *L) {
       lua_getglobal(L, "print");
       lua_insert(L, 1);
       if (lua_pcall(L, lua_gettop(L)-1, 0, 0) != 0)
-        l_message(progname, lua_pushfstring(L,
-                               "error calling " LUA_QL("print") " (%s)",
-                               lua_tostring(L, -1)));
+	l_message(progname, lua_pushfstring(L,
+			       "error calling " LUA_QL("print") " (%s)",
+			       lua_tostring(L, -1)));
     }
   }
   lua_settop(L, 0);  /* clear stack */
@@ -242,14 +352,14 @@ static int handle_script (lua_State *L, char **argv, int n) {
   int narg = getargs(L, argv, n);  /* collect arguments */
   lua_setglobal(L, "arg");
   fname = argv[n];
-  if (strcmp(fname, "-") == 0 && strcmp(argv[n-1], "--") != 0) 
+  if (strcmp(fname, "-") == 0 && strcmp(argv[n-1], "--") != 0)
     fname = NULL;  /* stdin */
   status = luaL_loadfile(L, fname);
   lua_insert(L, -(narg+1));
   if (status == 0)
     status = docall(L, narg, 0);
   else
-    lua_pop(L, narg);      
+    lua_pop(L, narg);
   return report(L, status);
 }
 
@@ -257,33 +367,72 @@ static int handle_script (lua_State *L, char **argv, int n) {
 /* check that argument has no extra characters at the end */
 #define notail(x)	{if ((x)[2] != '\0') return -1;}
 
+static int tlsf_handle_args (char **argv, int argc)
+{
+  int i;
+  long int size;
+  size=TLSF_POOL_DEF_SIZE;
+
+  for(i=1; argv[i] != NULL; i++) {
+    if (argv[i][0] != '-')  /* not an option? */
+		  break;
+    if (argv[i][1] == 'm') {
+		  if (argv[i][2] != '\0') {
+			  size = strtol(&argv[i][2], NULL, 0);
+				  goto alloc;
+        } else {
+          if (argv[i+1] == NULL) {
+            print_usage();
+            return -1;
+        } else {
+          size = strtol(argv[i+1], NULL, 0);
+          goto alloc;
+        }
+      }
+    }
+  }
+
+ alloc:
+  if(size < TLSF_POOL_MIN_SIZE) {
+    fprintf(stderr, "invalid amount of memory: 0x%lx\n", size);
+    return -1;
+  }
+  pool = malloc(size);
+  if(!pool) {
+    fprintf(stderr, "malloc failed to alloc 0x%lx bytes\n", size);
+    return -2;
+  }
+  pool_size = init_memory_pool(size, pool);
+  return 0;
+}
 
 static int collectargs (char **argv, int *pi, int *pv, int *pe) {
   int i;
   for (i = 1; argv[i] != NULL; i++) {
     if (argv[i][0] != '-')  /* not an option? */
-        return i;
+	return i;
     switch (argv[i][1]) {  /* option */
       case '-':
-        notail(argv[i]);
-        return (argv[i+1] != NULL ? i+1 : 0);
+	notail(argv[i]);
+	return (argv[i+1] != NULL ? i+1 : 0);
       case '\0':
-        return i;
+	return i;
       case 'i':
-        notail(argv[i]);
-        *pi = 1;  /* go through */
+	notail(argv[i]);
+	*pi = 1;  /* go through */
       case 'v':
-        notail(argv[i]);
-        *pv = 1;
-        break;
+	notail(argv[i]);
+	*pv = 1;
+	break;
+      case 'm':   /* tlsf memory size */
       case 'e':
-        *pe = 1;  /* go through */
+	*pe = 1;  /* go through */
       case 'l':
-        if (argv[i][2] == '\0') {
-          i++;
-          if (argv[i] == NULL) return -1;
-        }
-        break;
+	if (argv[i][2] == '\0') {
+	  i++;
+	  if (argv[i] == NULL) return -1;
+	}
+	break;
       default: return -1;  /* invalid option */
     }
   }
@@ -298,20 +447,20 @@ static int runargs (lua_State *L, char **argv, int n) {
     lua_assert(argv[i][0] == '-');
     switch (argv[i][1]) {  /* option */
       case 'e': {
-        const char *chunk = argv[i] + 2;
-        if (*chunk == '\0') chunk = argv[++i];
-        lua_assert(chunk != NULL);
-        if (dostring(L, chunk, "=(command line)") != 0)
-          return 1;
-        break;
+	const char *chunk = argv[i] + 2;
+	if (*chunk == '\0') chunk = argv[++i];
+	lua_assert(chunk != NULL);
+	if (dostring(L, chunk, "=(command line)") != 0)
+	  return 1;
+	break;
       }
       case 'l': {
-        const char *filename = argv[i] + 2;
-        if (*filename == '\0') filename = argv[++i];
-        lua_assert(filename != NULL);
-        if (dolibrary(L, filename))
-          return 1;  /* stop if file fails */
-        break;
+	const char *filename = argv[i] + 2;
+	if (*filename == '\0') filename = argv[++i];
+	lua_assert(filename != NULL);
+	if (dolibrary(L, filename))
+	  return 1;  /* stop if file fails */
+	break;
       }
       default: break;
     }
@@ -346,6 +495,9 @@ static int pmain (lua_State *L) {
   if (argv[0] && argv[0][0]) progname = argv[0];
   lua_gc(L, LUA_GCSTOP, 0);  /* stop collector during initialization */
   luaL_openlibs(L);  /* open libraries */
+#ifdef TLSF_DEBUG
+  luaL_register(L, "tlsf", tlsf_f);
+#endif
   lua_gc(L, LUA_GCRESTART, 0);
   s->status = handle_luainit(L);
   if (s->status != 0) return 0;
@@ -373,11 +525,13 @@ static int pmain (lua_State *L) {
   return 0;
 }
 
-
 int main (int argc, char **argv) {
   int status;
   struct Smain s;
-  lua_State *L = lua_open();  /* create state */
+	status = tlsf_handle_args(argv, argc);
+  if(status)
+    return EXIT_FAILURE;
+  lua_State *L = lua_newstate(tlsf_alloc, 0);
   if (L == NULL) {
     l_message(argv[0], "cannot create state: not enough memory");
     return EXIT_FAILURE;
@@ -389,4 +543,3 @@ int main (int argc, char **argv) {
   lua_close(L);
   return (status || s.status) ? EXIT_FAILURE : EXIT_SUCCESS;
 }
-
