@@ -1,0 +1,35 @@
+TLSF Lua
+--------
+
+This is Lua extended with the TLSF O(1) memory allocator [1]. An
+additional '-m' command line switch is provided to set the amount of
+memory (in bytes) that is pre-allocated.
+
+API
+---
+
+Some additonal functions are provided in the built-in 'tlsf' module:
+
+tlsf.warn(bool)
+	- without argument: return status
+	- with argument, enable/disable warnings on memory allocations
+
+tlsf.trace(bool)
+	- without argument: return status
+	- with argument, enable/disable backtracing on memory allocations
+
+tlsf.stats()
+	- returns three values:
+	    1. current tlsf memory use
+	    2. highest previous memory use
+	    3. total memory available
+
+
+License
+-------
+
+Lua is licensed under the MIT license. TLSF is licensed under a dual
+LGPL / GPLv2(with linking exception) license scheme. TLSF Lua is
+also released under the MIT License.
+
+[1] http://rtportal.upv.es/rtmalloc/
